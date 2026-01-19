@@ -17,9 +17,7 @@
 from __future__ import annotations
 
 import itertools
-import logging
 import os
-import time
 import uuid
 import warnings
 from abc import ABC, abstractmethod
@@ -155,8 +153,6 @@ if TYPE_CHECKING:
 
 ALWAYS_TRUE = AlwaysTrue()
 DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE = "downcast-ns-timestamp-to-us-on-write"
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass()
@@ -803,7 +799,6 @@ class Transaction:
         Returns:
             An UpsertResult class (contains details of rows updated and inserted)
         """
-        upsert_start = time.perf_counter()
         try:
             import pyarrow as pa  # noqa: F401
         except ModuleNotFoundError as e:
@@ -841,13 +836,11 @@ class Transaction:
         )
 
         # get list of rows that exist so we don't have to load the entire target table
-        t0 = time.perf_counter()
-        matched_predicate = upsert_util.create_match_filter(df, join_cols)
-        logger.info(f"[UPSERT TIMING] create_match_filter (initial): {time.perf_counter() - t0:.4f}s")
+        # Use coarse filter for initial scan - exact matching happens in get_rows_to_update()
+        matched_predicate = upsert_util.create_coarse_match_filter(df, join_cols)
 
         # We must use Transaction.table_metadata for the scan. This includes all uncommitted - but relevant - changes.
 
-        t0 = time.perf_counter()
         matched_iceberg_record_batches_scan = DataScan(
             table_metadata=self.table_metadata,
             io=self._table.io,
@@ -857,18 +850,13 @@ class Transaction:
 
         if branch in self.table_metadata.refs:
             matched_iceberg_record_batches_scan = matched_iceberg_record_batches_scan.use_ref(branch)
-        logger.info(f"[UPSERT TIMING] datascan_setup: {time.perf_counter() - t0:.4f}s")
 
-        t0 = time.perf_counter()
         matched_iceberg_record_batches = matched_iceberg_record_batches_scan.to_arrow_batch_reader()
-        logger.info(f"[UPSERT TIMING] to_arrow_batch_reader: {time.perf_counter() - t0:.4f}s")
 
         batches_to_overwrite = []
         overwrite_predicates = []
         rows_to_insert = df
 
-        batch_loop_start = time.perf_counter()
-        batch_idx = 0
         for batch in matched_iceberg_record_batches:
             rows = pa.Table.from_batches([batch])
 
@@ -876,33 +864,22 @@ class Transaction:
                 # function get_rows_to_update is doing a check on non-key columns to see if any of the values have actually changed
                 # we don't want to do just a blanket overwrite for matched rows if the actual non-key column data hasn't changed
                 # this extra step avoids unnecessary IO and writes
-                t0 = time.perf_counter()
                 rows_to_update = upsert_util.get_rows_to_update(df, rows, join_cols)
-                logger.info(f"[UPSERT TIMING] batch {batch_idx}: get_rows_to_update: {time.perf_counter() - t0:.4f}s")
 
                 if len(rows_to_update) > 0:
                     # build the match predicate filter
-                    t0 = time.perf_counter()
                     overwrite_mask_predicate = upsert_util.create_match_filter(rows_to_update, join_cols)
-                    logger.info(f"[UPSERT TIMING] batch {batch_idx}: create_match_filter (overwrite): {time.perf_counter() - t0:.4f}s")
 
                     batches_to_overwrite.append(rows_to_update)
                     overwrite_predicates.append(overwrite_mask_predicate)
 
             if when_not_matched_insert_all:
-                t0 = time.perf_counter()
                 expr_match = upsert_util.create_match_filter(rows, join_cols)
-                logger.info(f"[UPSERT TIMING] batch {batch_idx}: create_match_filter (insert): {time.perf_counter() - t0:.4f}s")
                 expr_match_bound = bind(self.table_metadata.schema(), expr_match, case_sensitive=case_sensitive)
                 expr_match_arrow = expression_to_pyarrow(expr_match_bound)
 
                 # Filter rows per batch.
-                t0 = time.perf_counter()
                 rows_to_insert = rows_to_insert.filter(~expr_match_arrow)
-                logger.info(f"[UPSERT TIMING] batch {batch_idx}: filter_rows_to_insert: {time.perf_counter() - t0:.4f}s")
-
-            batch_idx += 1
-        logger.info(f"[UPSERT TIMING] batch_loop_total: {time.perf_counter() - batch_loop_start:.4f}s ({batch_idx} iterations)")
 
         update_row_cnt = 0
         insert_row_cnt = 0
@@ -910,23 +887,18 @@ class Transaction:
         if batches_to_overwrite:
             rows_to_update = pa.concat_tables(batches_to_overwrite)
             update_row_cnt = len(rows_to_update)
-            t0 = time.perf_counter()
             self.overwrite(
                 rows_to_update,
                 overwrite_filter=Or(*overwrite_predicates) if len(overwrite_predicates) > 1 else overwrite_predicates[0],
                 branch=branch,
                 snapshot_properties=snapshot_properties,
             )
-            logger.info(f"[UPSERT TIMING] overwrite_operation: {time.perf_counter() - t0:.4f}s")
 
         if when_not_matched_insert_all:
             insert_row_cnt = len(rows_to_insert)
             if rows_to_insert:
-                t0 = time.perf_counter()
                 self.append(rows_to_insert, branch=branch, snapshot_properties=snapshot_properties)
-                logger.info(f"[UPSERT TIMING] append_operation: {time.perf_counter() - t0:.4f}s")
 
-        logger.info(f"[UPSERT TIMING] upsert_total: {time.perf_counter() - upsert_start:.4f}s")
         return UpsertResult(rows_updated=update_row_cnt, rows_inserted=insert_row_cnt)
 
     def add_files(
