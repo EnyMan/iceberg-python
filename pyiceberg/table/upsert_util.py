@@ -15,7 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 import functools
+import logging
 import operator
+import time
+
+logger = logging.getLogger(__name__)
 
 import pyarrow as pa
 from pyarrow import Table as pyarrow_table
@@ -157,6 +161,8 @@ def get_rows_to_update(source_table: pa.Table, target_table: pa.Table, join_cols
     Uses vectorized PyArrow operations for efficient comparison, avoiding row-by-row Python loops.
     The table is joined on the identifier columns, and then checked if there are any updated rows.
     """
+    func_start = time.perf_counter()
+
     all_columns = set(source_table.column_names)
     join_cols_set = set(join_cols)
 
@@ -167,10 +173,12 @@ def get_rows_to_update(source_table: pa.Table, target_table: pa.Table, join_cols
 
     if len(target_table) == 0:
         # When the target table is empty, there is nothing to update
+        logger.info(f"get_rows_to_update: {time.perf_counter() - func_start:.3f}s (empty target table)")
         return source_table.schema.empty_table()
 
     if len(non_key_cols) == 0:
         # No non-key columns to compare, all matched rows are "updates" but with no changes
+        logger.info(f"get_rows_to_update: {time.perf_counter() - func_start:.3f}s (no non-key columns)")
         return source_table.schema.empty_table()
 
     SOURCE_INDEX_COLUMN_NAME = "__source_index"
@@ -185,6 +193,7 @@ def get_rows_to_update(source_table: pa.Table, target_table: pa.Table, join_cols
     # Step 1: Prepare source index with join keys and a marker index
     # Cast to target table schema, so we can do the join
     # See: https://github.com/apache/arrow/issues/37542
+    index_start = time.perf_counter()
     source_index = (
         source_table.cast(target_table.schema)
         .select(join_cols_set)
@@ -193,22 +202,33 @@ def get_rows_to_update(source_table: pa.Table, target_table: pa.Table, join_cols
 
     # Step 2: Prepare target index with join keys and a marker
     target_index = target_table.select(join_cols_set).append_column(TARGET_INDEX_COLUMN_NAME, pa.array(range(len(target_table))))
+    index_end = time.perf_counter()
 
     # Step 3: Perform an inner join to find which rows from source exist in target
+    join_start = time.perf_counter()
     matching_indices = source_index.join(target_index, keys=list(join_cols_set), join_type="inner")
+    join_end = time.perf_counter()
 
     if len(matching_indices) == 0:
         # No matching rows found
+        logger.info(
+            f"get_rows_to_update: {time.perf_counter() - func_start:.3f}s "
+            f"(index prep: {index_end - index_start:.3f}s, join: {join_end - join_start:.3f}s, "
+            f"matched: 0, to_update: 0)"
+        )
         return source_table.schema.empty_table()
 
     # Step 4: Take matched rows in batch (vectorized - single operation)
+    take_start = time.perf_counter()
     source_indices = matching_indices[SOURCE_INDEX_COLUMN_NAME]
     target_indices = matching_indices[TARGET_INDEX_COLUMN_NAME]
 
     matched_source = source_table.take(source_indices)
     matched_target = target_table.take(target_indices)
+    take_end = time.perf_counter()
 
     # Step 5: Vectorized comparison per column
+    compare_start = time.perf_counter()
     diff_masks = []
     for col in non_key_cols:
         source_col = matched_source.column(col)
@@ -218,9 +238,20 @@ def get_rows_to_update(source_table: pa.Table, target_table: pa.Table, join_cols
 
     # Step 6: Combine masks with OR (any column different = needs update)
     combined_mask = functools.reduce(pc.or_, diff_masks)
+    compare_end = time.perf_counter()
 
     # Step 7: Filter to get indices of rows that need updating
     to_update_indices = pc.filter(source_indices, combined_mask)
+
+    func_end = time.perf_counter()
+    logger.info(
+        f"get_rows_to_update: {func_end - func_start:.3f}s "
+        f"(index prep: {index_end - index_start:.3f}s, "
+        f"join: {join_end - join_start:.3f}s, "
+        f"take: {take_end - take_start:.3f}s, "
+        f"compare: {compare_end - compare_start:.3f}s, "
+        f"matched: {len(matching_indices)}, to_update: {len(to_update_indices)})"
+    )
 
     if len(to_update_indices) > 0:
         return source_table.take(to_update_indices)
