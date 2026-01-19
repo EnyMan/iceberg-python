@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import os
+import time
 import uuid
 import warnings
 from abc import ABC, abstractmethod
@@ -153,6 +155,8 @@ if TYPE_CHECKING:
 
 ALWAYS_TRUE = AlwaysTrue()
 DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE = "downcast-ns-timestamp-to-us-on-write"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass()
@@ -521,6 +525,7 @@ class Transaction:
         with self._append_snapshot_producer(snapshot_properties, branch=branch) as append_files:
             # skip writing data files if the dataframe is empty
             if df.shape[0] > 0:
+                write_start = time.perf_counter()
                 data_files = list(
                     _dataframe_to_data_files(
                         table_metadata=self.table_metadata, write_uuid=append_files.commit_uuid, df=df, io=self._table.io
@@ -528,6 +533,8 @@ class Transaction:
                 )
                 for data_file in data_files:
                     append_files.append_data_file(data_file)
+                write_end = time.perf_counter()
+                logger.info(f"Append data file writing: {write_end - write_start:.3f}s ({df.shape[0]} rows)")
 
     def dynamic_partition_overwrite(
         self, df: pa.Table, snapshot_properties: dict[str, str] = EMPTY_DICT, branch: str | None = MAIN_BRANCH
@@ -636,21 +643,27 @@ class Transaction:
 
         if overwrite_filter != AlwaysFalse():
             # Only delete when the filter is != AlwaysFalse
+            delete_start = time.perf_counter()
             self.delete(
                 delete_filter=overwrite_filter,
                 case_sensitive=case_sensitive,
                 snapshot_properties=snapshot_properties,
                 branch=branch,
             )
+            delete_end = time.perf_counter()
+            logger.info(f"Overwrite delete operation: {delete_end - delete_start:.3f}s")
 
         with self._append_snapshot_producer(snapshot_properties, branch=branch) as append_files:
             # skip writing data files if the dataframe is empty
             if df.shape[0] > 0:
+                write_start = time.perf_counter()
                 data_files = _dataframe_to_data_files(
                     table_metadata=self.table_metadata, write_uuid=append_files.commit_uuid, df=df, io=self._table.io
                 )
                 for data_file in data_files:
                     append_files.append_data_file(data_file)
+                write_end = time.perf_counter()
+                logger.info(f"Overwrite data file writing: {write_end - write_start:.3f}s ({df.shape[0]} rows)")
 
     def delete(
         self,
@@ -799,6 +812,8 @@ class Transaction:
         Returns:
             An UpsertResult class (contains details of rows updated and inserted)
         """
+        upsert_start = time.perf_counter()
+
         try:
             import pyarrow as pa  # noqa: F401
         except ModuleNotFoundError as e:
@@ -835,9 +850,15 @@ class Transaction:
             format_version=self.table_metadata.format_version,
         )
 
+        setup_end = time.perf_counter()
+        logger.info(f"Upsert setup (join cols, validation): {setup_end - upsert_start:.3f}s")
+
         # get list of rows that exist so we don't have to load the entire target table
         # Use coarse filter for initial scan - exact matching happens in get_rows_to_update()
         matched_predicate = upsert_util.create_coarse_match_filter(df, join_cols)
+
+        coarse_filter_end = time.perf_counter()
+        logger.info(f"Coarse match filter creation: {coarse_filter_end - setup_end:.3f}s")
 
         # We must use Transaction.table_metadata for the scan. This includes all uncommitted - but relevant - changes.
 
@@ -851,20 +872,30 @@ class Transaction:
         if branch in self.table_metadata.refs:
             matched_iceberg_record_batches_scan = matched_iceberg_record_batches_scan.use_ref(branch)
 
+        scan_start = time.perf_counter()
         matched_iceberg_record_batches = matched_iceberg_record_batches_scan.to_arrow_batch_reader()
+        scan_end = time.perf_counter()
+        logger.info(f"Scan setup (to_arrow_batch_reader): {scan_end - scan_start:.3f}s")
 
         batches_to_overwrite = []
         overwrite_predicates = []
         rows_to_insert = df
 
+        batch_loop_start = time.perf_counter()
+        batch_count = 0
+        total_rows_to_update_time = 0.0
+
         for batch in matched_iceberg_record_batches:
+            batch_count += 1
             rows = pa.Table.from_batches([batch])
 
             if when_matched_update_all:
                 # function get_rows_to_update is doing a check on non-key columns to see if any of the values have actually changed
                 # we don't want to do just a blanket overwrite for matched rows if the actual non-key column data hasn't changed
                 # this extra step avoids unnecessary IO and writes
+                rows_to_update_start = time.perf_counter()
                 rows_to_update = upsert_util.get_rows_to_update(df, rows, join_cols)
+                total_rows_to_update_time += time.perf_counter() - rows_to_update_start
 
                 if len(rows_to_update) > 0:
                     # build the match predicate filter
@@ -881,23 +912,38 @@ class Transaction:
                 # Filter rows per batch.
                 rows_to_insert = rows_to_insert.filter(~expr_match_arrow)
 
+        batch_loop_end = time.perf_counter()
+        logger.info(
+            f"Batch processing: {batch_loop_end - batch_loop_start:.3f}s "
+            f"({batch_count} batches, get_rows_to_update total: {total_rows_to_update_time:.3f}s)"
+        )
+
         update_row_cnt = 0
         insert_row_cnt = 0
 
         if batches_to_overwrite:
             rows_to_update = pa.concat_tables(batches_to_overwrite)
             update_row_cnt = len(rows_to_update)
+            overwrite_start = time.perf_counter()
             self.overwrite(
                 rows_to_update,
                 overwrite_filter=Or(*overwrite_predicates) if len(overwrite_predicates) > 1 else overwrite_predicates[0],
                 branch=branch,
                 snapshot_properties=snapshot_properties,
             )
+            overwrite_end = time.perf_counter()
+            logger.info(f"Overwrite: {overwrite_end - overwrite_start:.3f}s ({update_row_cnt} rows)")
 
         if when_not_matched_insert_all:
             insert_row_cnt = len(rows_to_insert)
             if rows_to_insert:
+                append_start = time.perf_counter()
                 self.append(rows_to_insert, branch=branch, snapshot_properties=snapshot_properties)
+                append_end = time.perf_counter()
+                logger.info(f"Append: {append_end - append_start:.3f}s ({insert_row_cnt} rows)")
+
+        upsert_end = time.perf_counter()
+        logger.info(f"Total upsert: {upsert_end - upsert_start:.3f}s (updated: {update_row_cnt}, inserted: {insert_row_cnt})")
 
         return UpsertResult(rows_updated=update_row_cnt, rows_inserted=insert_row_cnt)
 
