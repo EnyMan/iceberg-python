@@ -2373,26 +2373,34 @@ class DataScan(TableScan):
         manifest_scan_end = time.perf_counter()
 
         task_creation_start = time.perf_counter()
-        tasks = [
-            FileScanTask(
-                data_entry.data_file,
-                delete_files=_match_deletes_to_data_file(
-                    data_entry,
-                    positional_delete_entries,
-                ),
-                residual=residual_evaluators[data_entry.data_file.spec_id](data_entry.data_file).residual_for(
-                    data_entry.data_file.partition
-                ),
+        tasks = []
+        total_delete_match_time = 0.0
+        total_residual_time = 0.0
+
+        for data_entry in data_entries:
+            delete_match_start = time.perf_counter()
+            delete_files = _match_deletes_to_data_file(data_entry, positional_delete_entries)
+            delete_match_end = time.perf_counter()
+            total_delete_match_time += delete_match_end - delete_match_start
+
+            residual_start = time.perf_counter()
+            residual = residual_evaluators[data_entry.data_file.spec_id](data_entry.data_file).residual_for(
+                data_entry.data_file.partition
             )
-            for data_entry in data_entries
-        ]
+            residual_end = time.perf_counter()
+            total_residual_time += residual_end - residual_start
+
+            tasks.append(FileScanTask(data_entry.data_file, delete_files=delete_files, residual=residual))
+
         task_creation_end = time.perf_counter()
 
         logger.info(
-            "[SCAN TIMING] _plan_files_local: %.4fs (manifest_scan: %.4fs, task_creation: %.4fs, data_files: %d, delete_files: %d)",
+            "[SCAN TIMING] _plan_files_local: %.4fs (manifest_scan: %.4fs, task_creation: %.4fs [delete_match: %.4fs, residual: %.4fs], data_files: %d, delete_files: %d)",
             time.perf_counter() - plan_start,
             manifest_scan_end - manifest_scan_start,
             task_creation_end - task_creation_start,
+            total_delete_match_time,
+            total_residual_time,
             len(data_entries),
             len(positional_delete_entries),
         )
@@ -2441,9 +2449,31 @@ class DataScan(TableScan):
 
         from pyiceberg.io.pyarrow import ArrowScan, schema_to_pyarrow
 
+        def count_expression_nodes(expr: BooleanExpression) -> tuple[int, int, int]:
+            """Count (total_nodes, or_count, and_count) in expression tree."""
+            if isinstance(expr, Or):
+                left_total, left_or, left_and = count_expression_nodes(expr.left)
+                right_total, right_or, right_and = count_expression_nodes(expr.right)
+                return (left_total + right_total + 1, left_or + right_or + 1, left_and + right_and)
+            elif isinstance(expr, And):
+                left_total, left_or, left_and = count_expression_nodes(expr.left)
+                right_total, right_or, right_and = count_expression_nodes(expr.right)
+                return (left_total + right_total + 1, left_or + right_or, left_and + right_and + 1)
+            else:
+                return (1, 0, 0)
+
         func_start = time.perf_counter()
 
         target_schema = schema_to_pyarrow(self.projection())
+
+        # Log filter complexity
+        total_nodes, or_count, and_count = count_expression_nodes(self.row_filter)
+        logger.info(
+            "[SCAN TIMING] row_filter complexity: (total_nodes: %d, or_count: %d, and_count: %d)",
+            total_nodes,
+            or_count,
+            and_count,
+        )
 
         plan_start = time.perf_counter()
         file_tasks = self.plan_files()

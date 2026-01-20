@@ -1604,11 +1604,26 @@ def _task_to_record_batches(
         filter_start = time.perf_counter()
         pyarrow_filter = None
         if bound_row_filter is not AlwaysTrue():
+            translate_start = time.perf_counter()
             translated_row_filter = translate_column_names(
                 bound_row_filter, file_schema, case_sensitive=case_sensitive, projected_field_values=projected_missing_fields
             )
+            translate_end = time.perf_counter()
+
+            bind_start = time.perf_counter()
             bound_file_filter = bind(file_schema, translated_row_filter, case_sensitive=case_sensitive)
+            bind_end = time.perf_counter()
+
+            to_pyarrow_start = time.perf_counter()
             pyarrow_filter = expression_to_pyarrow(bound_file_filter, file_schema)
+            to_pyarrow_end = time.perf_counter()
+
+            logger.info(
+                "[SCAN TIMING] filter_prep breakdown: (translate: %.4fs, bind: %.4fs, to_pyarrow: %.4fs)",
+                translate_end - translate_start,
+                bind_end - bind_start,
+                to_pyarrow_end - to_pyarrow_start,
+            )
 
         file_project_schema = prune_columns(file_schema, projected_field_ids, select_full_types=False)
 
