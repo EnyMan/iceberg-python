@@ -812,8 +812,6 @@ class Transaction:
         Returns:
             An UpsertResult class (contains details of rows updated and inserted)
         """
-        upsert_start = time.perf_counter()
-
         try:
             import pyarrow as pa  # noqa: F401
         except ModuleNotFoundError as e:
@@ -849,15 +847,10 @@ class Transaction:
             format_version=self.table_metadata.format_version,
         )
 
-        setup_end = time.perf_counter()
-        logger.info(f"Upsert setup (join cols, validation): {setup_end - upsert_start:.3f}s")
-
-        # get list of rows that exist so we don't have to load the entire target table
-        # Use coarse filter for initial scan - exact matching happens in get_rows_to_update()
+        # Create a coarse filter for the initial scan to reduce the number of rows read.
+        # This filter is intentionally less precise but faster to evaluate than exact matching.
+        # Exact key matching happens downstream in get_rows_to_update() via PyArrow joins.
         matched_predicate = upsert_util.create_coarse_match_filter(df, join_cols)
-
-        coarse_filter_end = time.perf_counter()
-        logger.info(f"Coarse match filter creation: {coarse_filter_end - setup_end:.3f}s")
 
         # We must use Transaction.table_metadata for the scan. This includes all uncommitted - but relevant - changes.
 
@@ -871,52 +864,36 @@ class Transaction:
         if branch in self.table_metadata.refs:
             matched_iceberg_record_batches_scan = matched_iceberg_record_batches_scan.use_ref(branch)
 
-        scan_start = time.perf_counter()
         matched_iceberg_record_batches = matched_iceberg_record_batches_scan.to_arrow_batch_reader()
-        scan_end = time.perf_counter()
-        logger.info(f"Scan setup (to_arrow_batch_reader): {scan_end - scan_start:.3f}s")
 
         batches_to_overwrite = []
         overwrite_predicates = []
-        matched_target_keys: list[pa.Table] = []  # Accumulate matched keys for insert filtering
-
-        batch_loop_start = time.perf_counter()
-        batch_count = 0
-        total_rows_to_update_time = 0.0
+        # Accumulate matched keys for anti-join insert filtering after the batch loop.
+        # We only store key columns (not full rows) to minimize memory usage.
+        matched_target_keys: list[pa.Table] = []
 
         for batch in matched_iceberg_record_batches:
-            batch_count += 1
             rows = pa.Table.from_batches([batch])
 
             if when_matched_update_all:
-                # function get_rows_to_update is doing a check on non-key columns to see if any of the values have actually changed
-                # we don't want to do just a blanket overwrite for matched rows if the actual non-key column data hasn't changed
-                # this extra step avoids unnecessary IO and writes
-                rows_to_update_start = time.perf_counter()
+                # Check non-key columns to see if values have actually changed.
+                # We don't want to do a blanket overwrite for matched rows if the
+                # actual non-key column data hasn't changed - this avoids unnecessary IO and writes.
                 rows_to_update = upsert_util.get_rows_to_update(df, rows, join_cols)
-                total_rows_to_update_time += time.perf_counter() - rows_to_update_start
 
                 if len(rows_to_update) > 0:
-                    # build the match predicate filter
                     overwrite_mask_predicate = upsert_util.create_match_filter(rows_to_update, join_cols)
-
                     batches_to_overwrite.append(rows_to_update)
                     overwrite_predicates.append(overwrite_mask_predicate)
 
-            # Collect matched keys for insert filtering (will use anti-join after loop)
             if when_not_matched_insert_all:
                 matched_target_keys.append(rows.select(join_cols))
 
-        batch_loop_end = time.perf_counter()
-        logger.info(
-            f"Batch processing: {batch_loop_end - batch_loop_start:.3f}s "
-            f"({batch_count} batches, get_rows_to_update total: {total_rows_to_update_time:.3f}s)"
-        )
-
-        # Use anti-join to find rows to insert (replaces per-batch expression filtering)
+        # Use anti-join to find rows to insert. This is more efficient than per-batch
+        # expression filtering because: (1) we build expressions once, not per batch,
+        # and (2) PyArrow joins are faster than evaluating large Or(...) expressions.
         rows_to_insert = df
         if when_not_matched_insert_all and matched_target_keys:
-            filter_start = time.perf_counter()
             # Combine all matched keys and deduplicate
             combined_matched_keys = pa.concat_tables(matched_target_keys).group_by(join_cols).aggregate([])
             # Cast matched keys to source schema types for join compatibility
@@ -929,8 +906,6 @@ class Transaction:
             not_matched_keys = source_keys_with_idx.join(combined_matched_keys, keys=join_cols, join_type="left anti")
             indices_to_keep = not_matched_keys.column("__row_idx__").combine_chunks()
             rows_to_insert = df.take(indices_to_keep)
-            filter_end = time.perf_counter()
-            logger.info(f"Insert filtering (anti-join): {filter_end - filter_start:.3f}s ({len(combined_matched_keys)} matched keys)")
 
         update_row_cnt = 0
         insert_row_cnt = 0
@@ -938,26 +913,17 @@ class Transaction:
         if batches_to_overwrite:
             rows_to_update = pa.concat_tables(batches_to_overwrite)
             update_row_cnt = len(rows_to_update)
-            overwrite_start = time.perf_counter()
             self.overwrite(
                 rows_to_update,
                 overwrite_filter=Or(*overwrite_predicates) if len(overwrite_predicates) > 1 else overwrite_predicates[0],
                 branch=branch,
                 snapshot_properties=snapshot_properties,
             )
-            overwrite_end = time.perf_counter()
-            logger.info(f"Overwrite: {overwrite_end - overwrite_start:.3f}s ({update_row_cnt} rows)")
 
         if when_not_matched_insert_all:
             insert_row_cnt = len(rows_to_insert)
             if rows_to_insert:
-                append_start = time.perf_counter()
                 self.append(rows_to_insert, branch=branch, snapshot_properties=snapshot_properties)
-                append_end = time.perf_counter()
-                logger.info(f"Append: {append_end - append_start:.3f}s ({insert_row_cnt} rows)")
-
-        upsert_end = time.perf_counter()
-        logger.info(f"Total upsert: {upsert_end - upsert_start:.3f}s (updated: {update_row_cnt}, inserted: {insert_row_cnt})")
 
         return UpsertResult(rows_updated=update_row_cnt, rows_inserted=insert_row_cnt)
 
@@ -2180,11 +2146,14 @@ class DataScan(TableScan):
 
     def _plan_files_local(self) -> Iterable[FileScanTask]:
         """Plan files locally by reading manifests."""
+        plan_start = time.perf_counter()
+
         data_entries: list[ManifestEntry] = []
         positional_delete_entries = SortedList(key=lambda entry: entry.sequence_number or INITIAL_SEQUENCE_NUMBER)
 
         residual_evaluators: dict[int, Callable[[DataFile], ResidualEvaluator]] = KeyDefaultDict(self._build_residual_evaluator)
 
+        manifest_scan_start = time.perf_counter()
         for manifest_entry in chain.from_iterable(self.scan_plan_helper()):
             data_file = manifest_entry.data_file
             if data_file.content == DataFileContent.DATA:
@@ -2195,20 +2164,41 @@ class DataScan(TableScan):
                 raise ValueError("PyIceberg does not yet support equality deletes: https://github.com/apache/iceberg/issues/6568")
             else:
                 raise ValueError(f"Unknown DataFileContent ({data_file.content}): {manifest_entry}")
+        manifest_scan_end = time.perf_counter()
 
-        return [
-            FileScanTask(
-                data_entry.data_file,
-                delete_files=_match_deletes_to_data_file(
-                    data_entry,
-                    positional_delete_entries,
-                ),
-                residual=residual_evaluators[data_entry.data_file.spec_id](data_entry.data_file).residual_for(
-                    data_entry.data_file.partition
-                ),
+        task_creation_start = time.perf_counter()
+        tasks = []
+        total_delete_match_time = 0.0
+        total_residual_time = 0.0
+
+        for data_entry in data_entries:
+            delete_match_start = time.perf_counter()
+            delete_files = _match_deletes_to_data_file(data_entry, positional_delete_entries)
+            delete_match_end = time.perf_counter()
+            total_delete_match_time += delete_match_end - delete_match_start
+
+            residual_start = time.perf_counter()
+            residual = residual_evaluators[data_entry.data_file.spec_id](data_entry.data_file).residual_for(
+                data_entry.data_file.partition
             )
-            for data_entry in data_entries
-        ]
+            residual_end = time.perf_counter()
+            total_residual_time += residual_end - residual_start
+
+            tasks.append(FileScanTask(data_entry.data_file, delete_files=delete_files, residual=residual))
+
+        task_creation_end = time.perf_counter()
+
+        logger.info(
+            "[SCAN TIMING] _plan_files_local: %.4fs (manifest_scan: %.4fs, task_creation: %.4fs [delete_match: %.4fs, residual: %.4fs], data_files: %d, delete_files: %d)",
+            time.perf_counter() - plan_start,
+            manifest_scan_end - manifest_scan_start,
+            task_creation_end - task_creation_start,
+            total_delete_match_time,
+            total_residual_time,
+            len(data_entries),
+            len(positional_delete_entries),
+        )
+        return tasks
 
     def plan_files(self) -> Iterable[FileScanTask]:
         """Plans the relevant files by filtering on the PartitionSpecs.
@@ -2253,10 +2243,48 @@ class DataScan(TableScan):
 
         from pyiceberg.io.pyarrow import ArrowScan, schema_to_pyarrow
 
+        def count_expression_nodes(expr: BooleanExpression) -> tuple[int, int, int]:
+            """Count (total_nodes, or_count, and_count) in expression tree."""
+            if isinstance(expr, Or):
+                left_total, left_or, left_and = count_expression_nodes(expr.left)
+                right_total, right_or, right_and = count_expression_nodes(expr.right)
+                return (left_total + right_total + 1, left_or + right_or + 1, left_and + right_and)
+            elif isinstance(expr, And):
+                left_total, left_or, left_and = count_expression_nodes(expr.left)
+                right_total, right_or, right_and = count_expression_nodes(expr.right)
+                return (left_total + right_total + 1, left_or + right_or, left_and + right_and + 1)
+            else:
+                return (1, 0, 0)
+
+        func_start = time.perf_counter()
+
         target_schema = schema_to_pyarrow(self.projection())
+
+        # Log filter complexity
+        total_nodes, or_count, and_count = count_expression_nodes(self.row_filter)
+        logger.info(
+            "[SCAN TIMING] row_filter complexity: (total_nodes: %d, or_count: %d, and_count: %d)",
+            total_nodes,
+            or_count,
+            and_count,
+        )
+
+        plan_start = time.perf_counter()
+        file_tasks = self.plan_files()
+        plan_end = time.perf_counter()
+
+        scan_start = time.perf_counter()
         batches = ArrowScan(
             self.table_metadata, self.io, self.projection(), self.row_filter, self.case_sensitive, self.limit
-        ).to_record_batches(self.plan_files())
+        ).to_record_batches(file_tasks)
+        scan_end = time.perf_counter()
+
+        logger.info(
+            "[SCAN TIMING] to_arrow_batch_reader: (plan_files: %.4fs, scan_setup: %.4fs, total_setup: %.4fs)",
+            plan_end - plan_start,
+            scan_end - scan_start,
+            time.perf_counter() - func_start,
+        )
 
         return pa.RecordBatchReader.from_batches(
             target_schema,
