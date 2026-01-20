@@ -53,7 +53,7 @@ class MaintenanceTable:
 
         Example:
             result = (
-                table.maintenance()
+                table.maintenance
                 .rewrite_data_files()
                 .filter("year = 2024")  # Optional: restrict to partitions
                 .option("target-file-size-bytes", "134217728")  # Optional: 128MB

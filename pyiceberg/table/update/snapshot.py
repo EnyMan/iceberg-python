@@ -1515,7 +1515,7 @@ class RewriteDataFiles(UpdateTableMetadata["RewriteDataFiles"]):
         # Create an overwrite operation to delete old files and add new ones
         io = self._transaction._table.io
         overwrite = _OverwriteFiles(
-            operation=Operation.REPLACE,
+            operation=Operation.OVERWRITE,
             transaction=self._transaction,
             io=io,
         )
