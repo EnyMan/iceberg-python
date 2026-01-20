@@ -27,11 +27,19 @@ from pyarrow import compute as pc
 
 from pyiceberg.expressions import (
     AlwaysFalse,
+    AlwaysTrue,
+    And,
     BooleanExpression,
     EqualTo,
+    GreaterThanOrEqual,
     In,
+    LessThanOrEqual,
     Or,
 )
+
+# Threshold for switching from In() predicate to range-based or no filter
+# When unique keys exceed this, the In() predicate becomes too expensive to process
+LARGE_FILTER_THRESHOLD = 10_000
 
 
 def create_match_filter(df: pyarrow_table, join_cols: list[str]) -> BooleanExpression:
@@ -62,32 +70,116 @@ def create_match_filter(df: pyarrow_table, join_cols: list[str]) -> BooleanExpre
             return Or(*filters)
 
 
+def _is_numeric_type(arrow_type: pa.DataType) -> bool:
+    """Check if a PyArrow type is numeric (suitable for range filtering)."""
+    return pa.types.is_integer(arrow_type) or pa.types.is_floating(arrow_type)
+
+
+def _create_range_filter(col_name: str, values: pa.Array) -> BooleanExpression:
+    """Create a min/max range filter for a numeric column."""
+    min_val = pc.min(values).as_py()
+    max_val = pc.max(values).as_py()
+    return And(GreaterThanOrEqual(col_name, min_val), LessThanOrEqual(col_name, max_val))
+
+
 def create_coarse_match_filter(df: pyarrow_table, join_cols: list[str]) -> BooleanExpression:
     """
     Create a coarse Iceberg BooleanExpression filter for initial row scanning.
 
-    For single-column keys, uses an efficient In() predicate (exact match).
-    For composite keys, uses In() per column as a coarse filter (AND of In() predicates),
-    which may return false positives but is much more efficient than exact matching.
+    For small datasets (< LARGE_FILTER_THRESHOLD unique keys):
+      - Single-column keys: uses In() predicate
+      - Composite keys: uses AND of In() predicates per column
+
+    For large datasets (>= LARGE_FILTER_THRESHOLD unique keys):
+      - Single numeric column with dense IDs: uses min/max range filter
+      - Otherwise: returns AlwaysTrue() to skip filtering (full scan)
 
     This function should only be used for initial scans where exact matching happens
     downstream (e.g., in get_rows_to_update() via the join operation).
     """
     unique_keys = df.select(join_cols).group_by(join_cols).aggregate([])
+    num_unique_keys = len(unique_keys)
 
-    if len(unique_keys) == 0:
+    if num_unique_keys == 0:
         return AlwaysFalse()
 
+    # For small datasets, use the standard In() approach
+    if num_unique_keys < LARGE_FILTER_THRESHOLD:
+        if len(join_cols) == 1:
+            return In(join_cols[0], unique_keys[0].to_pylist())
+        else:
+            column_filters = []
+            for col in join_cols:
+                unique_values = pc.unique(unique_keys[col]).to_pylist()
+                column_filters.append(In(col, unique_values))
+            return functools.reduce(operator.and_, column_filters)
+
+    # For large datasets, use optimized strategies
+    logger.info(
+        f"Large dataset detected ({num_unique_keys} unique keys >= {LARGE_FILTER_THRESHOLD} threshold), "
+        "using optimized filter strategy"
+    )
+
     if len(join_cols) == 1:
-        return In(join_cols[0], unique_keys[0].to_pylist())
+        col_name = join_cols[0]
+        col_data = unique_keys[col_name]
+        col_type = col_data.type
+
+        # For numeric columns, check if range filter is efficient (dense IDs)
+        if _is_numeric_type(col_type):
+            min_val = pc.min(col_data).as_py()
+            max_val = pc.max(col_data).as_py()
+            value_range = max_val - min_val + 1
+            density = num_unique_keys / value_range if value_range > 0 else 0
+
+            # If IDs are dense (>10% coverage of the range), use range filter
+            # Otherwise, range filter would read too much irrelevant data
+            if density > 0.1:
+                logger.info(
+                    f"Using range filter for column '{col_name}': "
+                    f"min={min_val}, max={max_val}, density={density:.2%}"
+                )
+                return _create_range_filter(col_name, col_data)
+            else:
+                logger.info(
+                    f"Skipping filter (sparse IDs, density={density:.2%}): "
+                    f"full scan will be performed"
+                )
+                return AlwaysTrue()
+        else:
+            # Non-numeric single column with many values - skip filter
+            logger.info(
+                f"Skipping filter for non-numeric column '{col_name}' with {num_unique_keys} values: "
+                "full scan will be performed"
+            )
+            return AlwaysTrue()
     else:
-        # For composite keys: use In() per column as a coarse filter
-        # This is more efficient than creating Or(And(...), And(...), ...) for each row
-        # May include false positives, but fine-grained matching happens downstream
+        # Composite keys with many values - use range filters for numeric columns where possible
         column_filters = []
         for col in join_cols:
-            unique_values = pc.unique(unique_keys[col]).to_pylist()
-            column_filters.append(In(col, unique_values))
+            col_data = unique_keys[col]
+            col_type = col_data.type
+            unique_values = pc.unique(col_data)
+
+            if _is_numeric_type(col_type) and len(unique_values) >= LARGE_FILTER_THRESHOLD:
+                # Use range filter for large numeric columns
+                min_val = pc.min(unique_values).as_py()
+                max_val = pc.max(unique_values).as_py()
+                value_range = max_val - min_val + 1
+                density = len(unique_values) / value_range if value_range > 0 else 0
+
+                if density > 0.1:
+                    logger.info(f"Using range filter for composite key column '{col}': density={density:.2%}")
+                    column_filters.append(_create_range_filter(col, unique_values))
+                else:
+                    # Sparse numeric column - still use In() as it's part of composite key
+                    column_filters.append(In(col, unique_values.to_pylist()))
+            else:
+                # Small column or non-numeric - use In()
+                column_filters.append(In(col, unique_values.to_pylist()))
+
+        if len(column_filters) == 0:
+            return AlwaysTrue()
         return functools.reduce(operator.and_, column_filters)
 
 
