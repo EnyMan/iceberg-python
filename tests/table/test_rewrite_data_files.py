@@ -462,3 +462,117 @@ def test_maintenance_rewrite_data_files_chaining(table_v2: "Table") -> None:
     assert isinstance(builder, RewriteDataFiles)
     assert builder._options["target-file-size-bytes"] == "134217728"
     assert builder._options["min-input-files"] == "3"
+
+
+# Integration tests that test the full commit path
+@pytest.fixture
+def catalog_with_table(tmp_path):
+    """Create a catalog with a table containing multiple small files."""
+    from pyiceberg.catalog.memory import InMemoryCatalog
+
+    catalog = InMemoryCatalog("test_catalog", warehouse=str(tmp_path))
+    catalog.create_namespace("default")
+    return catalog
+
+
+def test_rewrite_data_files_full_commit_path(catalog_with_table, tmp_path) -> None:
+    """Integration test: create table with small files, run rewrite, verify consolidation."""
+    # Create a simple schema
+    schema = pa.schema([
+        ("id", pa.int64()),
+        ("name", pa.string()),
+    ])
+
+    # Create table
+    table = catalog_with_table.create_table(
+        "default.test_rewrite",
+        schema=schema,
+    )
+
+    # Append multiple small batches to create multiple small files
+    for i in range(3):
+        small_data = pa.table({
+            "id": [i * 10 + j for j in range(10)],
+            "name": [f"name_{i * 10 + j}" for j in range(10)],
+        })
+        table.append(small_data)
+
+    # Verify we have multiple files
+    files_before = list(table.scan().plan_files())
+    assert len(files_before) == 3, f"Expected 3 files, got {len(files_before)}"
+
+    # Run rewrite with very small target size to ensure files are candidates
+    # and min-input-files=2 to allow grouping
+    result = (
+        table.maintenance
+        .rewrite_data_files()
+        .option("target-file-size-bytes", "1000000000")  # 1GB target (larger than our files)
+        .option("min-file-size-bytes", "100000000")  # 100MB min (larger than our files)
+        .option("min-input-files", "2")
+        .commit()
+    )
+
+    # Verify the result
+    assert result.rewritten_data_files_count == 3, f"Expected 3 files rewritten, got {result.rewritten_data_files_count}"
+    assert result.added_data_files_count >= 1, f"Expected at least 1 file added, got {result.added_data_files_count}"
+    assert result.failed_group_count == 0, f"Expected 0 failed groups, got {result.failed_group_count}"
+
+    # Verify data integrity - should still have all 30 rows
+    result_table = table.scan().to_arrow()
+    assert result_table.num_rows == 30, f"Expected 30 rows, got {result_table.num_rows}"
+
+    # Verify files were consolidated
+    files_after = list(table.scan().plan_files())
+    assert len(files_after) < len(files_before), f"Expected fewer files after rewrite: {len(files_after)} vs {len(files_before)}"
+
+
+def test_rewrite_data_files_no_candidates(catalog_with_table, tmp_path) -> None:
+    """Integration test: verify no rewrite when files are within size thresholds."""
+    schema = pa.schema([
+        ("id", pa.int64()),
+        ("name", pa.string()),
+    ])
+
+    table = catalog_with_table.create_table(
+        "default.test_rewrite_no_candidates",
+        schema=schema,
+    )
+
+    # Append a single batch
+    data = pa.table({
+        "id": [i for i in range(100)],
+        "name": [f"name_{i}" for i in range(100)],
+    })
+    table.append(data)
+
+    # Run rewrite with default thresholds - the file should be too small to be a candidate
+    # but we only have 1 file so min_input_files won't be met anyway
+    result = (
+        table.maintenance
+        .rewrite_data_files()
+        .option("min-input-files", "2")
+        .commit()
+    )
+
+    # No files should be rewritten because we only have 1 file
+    assert result.rewritten_data_files_count == 0
+    assert result.added_data_files_count == 0
+
+
+def test_rewrite_data_files_empty_table(catalog_with_table, tmp_path) -> None:
+    """Integration test: verify rewrite handles empty table gracefully."""
+    schema = pa.schema([
+        ("id", pa.int64()),
+    ])
+
+    table = catalog_with_table.create_table(
+        "default.test_rewrite_empty",
+        schema=schema,
+    )
+
+    # Table has no data, no snapshot
+    result = table.maintenance.rewrite_data_files().commit()
+
+    assert result.rewritten_data_files_count == 0
+    assert result.added_data_files_count == 0
+    assert result.failed_group_count == 0
