@@ -18,16 +18,20 @@ from __future__ import annotations
 
 import concurrent.futures
 import itertools
+import logging
 import uuid
 from abc import abstractmethod
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import Future
+from dataclasses import dataclass, field
 from datetime import datetime
 from functools import cached_property
-from typing import TYPE_CHECKING, Generic
+from typing import TYPE_CHECKING, Any, Generic
 
 from sortedcontainers import SortedList
+
+logger = logging.getLogger(__name__)
 
 from pyiceberg.avro.codecs import AvroCompressionCodec
 from pyiceberg.expressions import (
@@ -1123,3 +1127,412 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
             if snapshot.timestamp_ms < expire_from and snapshot.snapshot_id not in protected_ids:
                 self._snapshot_ids_to_expire.add(snapshot.snapshot_id)
         return self
+
+
+@dataclass
+class RewriteDataFilesResult:
+    """Result of a rewrite data files operation.
+
+    Attributes:
+        rewritten_data_files_count: Number of data files that were rewritten.
+        added_data_files_count: Number of new data files created.
+        rewritten_bytes: Total bytes of data files that were rewritten.
+        failed_group_count: Number of file groups that failed to be rewritten.
+    """
+
+    rewritten_data_files_count: int = 0
+    added_data_files_count: int = 0
+    rewritten_bytes: int = 0
+    failed_group_count: int = 0
+
+
+@dataclass
+class FileGroup:
+    """A group of data files to be rewritten together.
+
+    Attributes:
+        data_files: List of data files in this group.
+    """
+
+    data_files: list[DataFile] = field(default_factory=list)
+
+    @property
+    def total_size_bytes(self) -> int:
+        """Return the total size in bytes of all files in this group."""
+        return sum(f.file_size_in_bytes for f in self.data_files)
+
+    @property
+    def file_count(self) -> int:
+        """Return the number of files in this group."""
+        return len(self.data_files)
+
+
+class RewriteDataFiles(UpdateTableMetadata["RewriteDataFiles"]):
+    """Rewrite data files by compacting small files into larger ones.
+
+    This operation reads files that are below a size threshold and rewrites them
+    into optimally-sized files. Files are grouped by partition and bin-packed
+    to form groups for rewriting.
+
+    Usage:
+        result = (
+            table.maintenance()
+            .rewrite_data_files()
+            .filter("year = 2024")  # Optional: restrict to partitions
+            .option("target-file-size-bytes", "134217728")  # Optional: 128MB
+            .commit()
+        )
+    """
+
+    # Configuration option names
+    OPTION_TARGET_FILE_SIZE_BYTES = "target-file-size-bytes"
+    OPTION_MIN_FILE_SIZE_BYTES = "min-file-size-bytes"
+    OPTION_MAX_FILE_SIZE_BYTES = "max-file-size-bytes"
+    OPTION_MAX_FILE_GROUP_SIZE_BYTES = "max-file-group-size-bytes"
+    OPTION_MIN_INPUT_FILES = "min-input-files"
+
+    # Default values
+    DEFAULT_TARGET_FILE_SIZE_BYTES = 512 * 1024 * 1024  # 512 MB
+    DEFAULT_MAX_FILE_GROUP_SIZE_BYTES = 100 * 1024 * 1024 * 1024  # 100 GB
+    DEFAULT_MIN_INPUT_FILES = 2
+
+    _filter_expr: BooleanExpression | None
+    _options: dict[str, str]
+    _staged_result: RewriteDataFilesResult | None
+
+    def __init__(self, transaction: Transaction) -> None:
+        super().__init__(transaction)
+        from pyiceberg.expressions import AlwaysTrue
+
+        self._filter_expr = AlwaysTrue()
+        self._options = {}
+        self._staged_result = None
+
+    def filter(self, expr: str | BooleanExpression) -> RewriteDataFiles:
+        """Apply a filter to restrict which files are considered for rewriting.
+
+        Args:
+            expr: A filter expression (string or BooleanExpression) to filter files.
+
+        Returns:
+            This for method chaining.
+        """
+        from pyiceberg.expressions import And
+
+        from pyiceberg.table import _parse_row_filter
+
+        if self._filter_expr is None:
+            self._filter_expr = _parse_row_filter(expr)
+        else:
+            self._filter_expr = And(self._filter_expr, _parse_row_filter(expr))
+        return self
+
+    def option(self, name: str, value: str) -> RewriteDataFiles:
+        """Set a configuration option.
+
+        Args:
+            name: The option name.
+            value: The option value.
+
+        Returns:
+            This for method chaining.
+        """
+        self._options[name] = value
+        return self
+
+    def options(self, opts: dict[str, str]) -> RewriteDataFiles:
+        """Set multiple configuration options.
+
+        Args:
+            opts: Dictionary of option names to values.
+
+        Returns:
+            This for method chaining.
+        """
+        self._options.update(opts)
+        return self
+
+    @property
+    def _target_file_size(self) -> int:
+        """Get the target file size in bytes."""
+        if self.OPTION_TARGET_FILE_SIZE_BYTES in self._options:
+            return int(self._options[self.OPTION_TARGET_FILE_SIZE_BYTES])
+        return self.DEFAULT_TARGET_FILE_SIZE_BYTES
+
+    @property
+    def _min_file_size(self) -> int:
+        """Get the minimum file size threshold. Files smaller than this are candidates for rewrite."""
+        if self.OPTION_MIN_FILE_SIZE_BYTES in self._options:
+            return int(self._options[self.OPTION_MIN_FILE_SIZE_BYTES])
+        # Default: 75% of target size
+        return int(self._target_file_size * 0.75)
+
+    @property
+    def _max_file_size(self) -> int:
+        """Get the maximum file size threshold. Files larger than this are candidates for rewrite."""
+        if self.OPTION_MAX_FILE_SIZE_BYTES in self._options:
+            return int(self._options[self.OPTION_MAX_FILE_SIZE_BYTES])
+        # Default: 180% of target size
+        return int(self._target_file_size * 1.8)
+
+    @property
+    def _max_file_group_size(self) -> int:
+        """Get the maximum size of a file group for rewriting."""
+        if self.OPTION_MAX_FILE_GROUP_SIZE_BYTES in self._options:
+            return int(self._options[self.OPTION_MAX_FILE_GROUP_SIZE_BYTES])
+        return self.DEFAULT_MAX_FILE_GROUP_SIZE_BYTES
+
+    @property
+    def _min_input_files(self) -> int:
+        """Get the minimum number of input files required to trigger a rewrite."""
+        if self.OPTION_MIN_INPUT_FILES in self._options:
+            return int(self._options[self.OPTION_MIN_INPUT_FILES])
+        return self.DEFAULT_MIN_INPUT_FILES
+
+    def _should_rewrite(self, data_file: DataFile) -> bool:
+        """Determine if a data file should be rewritten based on size criteria.
+
+        A file is selected for rewrite if it is too small or too large.
+
+        Args:
+            data_file: The data file to evaluate.
+
+        Returns:
+            True if the file should be rewritten, False otherwise.
+        """
+        file_size = data_file.file_size_in_bytes
+        return file_size < self._min_file_size or file_size > self._max_file_size
+
+    def _get_candidate_files(self) -> list[DataFile]:
+        """Get data files that are candidates for rewriting.
+
+        Returns:
+            List of data files that match the filter and size criteria.
+        """
+        from pyiceberg.expressions import AlwaysTrue
+        from pyiceberg.expressions.visitors import inclusive_projection, manifest_evaluator
+
+        table_metadata = self._transaction.table_metadata
+        io = self._transaction._table.io
+        snapshot = table_metadata.current_snapshot()
+
+        if snapshot is None:
+            return []
+
+        candidates: list[DataFile] = []
+        filter_expr = self._filter_expr if self._filter_expr is not None else AlwaysTrue()
+
+        # Build partition filter for manifest pruning
+        schema = table_metadata.schema()
+
+        def build_manifest_evaluator(spec_id: int) -> Callable[[ManifestFile], bool]:
+            spec = table_metadata.specs()[spec_id]
+            partition_filter = inclusive_projection(schema, spec, case_sensitive=True)(filter_expr)
+            return manifest_evaluator(spec, schema, partition_filter, case_sensitive=True)
+
+        manifest_evaluators: dict[int, Callable[[ManifestFile], bool]] = KeyDefaultDict(build_manifest_evaluator)
+
+        for manifest_file in snapshot.manifests(io=io):
+            if manifest_file.content != ManifestContent.DATA:
+                continue
+
+            # Skip manifests that don't match the filter
+            if not manifest_evaluators[manifest_file.partition_spec_id](manifest_file):
+                continue
+
+            for entry in manifest_file.fetch_manifest_entry(io=io, discard_deleted=True):
+                data_file = entry.data_file
+                if data_file.content != DataFileContent.DATA:
+                    continue
+
+                if self._should_rewrite(data_file):
+                    candidates.append(data_file)
+
+        return candidates
+
+    @staticmethod
+    def _group_files_by_partition(files: list[DataFile]) -> dict[Any, list[DataFile]]:
+        """Group files by their partition values.
+
+        Args:
+            files: List of data files to group.
+
+        Returns:
+            Dictionary mapping partition keys to lists of data files.
+        """
+        from pyiceberg.typedef import Record
+
+        groups: dict[Any, list[DataFile]] = defaultdict(list)
+
+        for data_file in files:
+            # Use the partition Record directly as key (it has __hash__ and __eq__)
+            partition = data_file.partition
+            if partition is not None:
+                partition_key: Any = partition
+            else:
+                partition_key = Record()  # Empty record for unpartitioned
+            groups[partition_key].append(data_file)
+
+        return groups
+
+    def _bin_pack_groups(self, partition_groups: dict[Any, list[DataFile]]) -> list[FileGroup]:
+        """Bin-pack files within each partition into groups for rewriting.
+
+        Args:
+            partition_groups: Files grouped by partition.
+
+        Returns:
+            List of FileGroups ready for rewriting.
+        """
+        file_groups: list[FileGroup] = []
+
+        packer: ListPacker[DataFile] = ListPacker(
+            target_weight=self._max_file_group_size,
+            lookback=10,
+            largest_bin_first=False,
+        )
+
+        for partition_key, files in partition_groups.items():
+            # Bin pack files within this partition
+            bins = packer.pack(files, weight_func=lambda f: f.file_size_in_bytes)
+
+            for bin_files in bins:
+                # Only create a group if it has enough files
+                if len(bin_files) >= self._min_input_files:
+                    file_groups.append(FileGroup(data_files=bin_files))
+
+        return file_groups
+
+    def _rewrite_group(self, group: FileGroup) -> tuple[list[DataFile], list[DataFile]]:
+        """Rewrite a group of files.
+
+        Args:
+            group: The file group to rewrite.
+
+        Returns:
+            Tuple of (files_to_delete, files_to_add).
+        """
+        from pyiceberg.expressions import AlwaysTrue
+
+        from pyiceberg.io.pyarrow import ArrowScan, _dataframe_to_data_files
+        from pyiceberg.table import FileScanTask
+
+        table_metadata = self._transaction.table_metadata
+        io = self._transaction._table.io
+        schema = table_metadata.schema()
+
+        # Create scan tasks for the files in this group
+        tasks = [FileScanTask(data_file=f) for f in group.data_files]
+
+        # Read the data from all files in the group
+        arrow_scan = ArrowScan(
+            table_metadata=table_metadata,
+            io=io,
+            projected_schema=schema,
+            row_filter=AlwaysTrue(),
+            case_sensitive=True,
+        )
+
+        # Read all data into an Arrow table
+        arrow_table = arrow_scan.to_table(tasks)
+
+        if arrow_table.num_rows == 0:
+            # No data to write, just delete the old files
+            return list(group.data_files), []
+
+        # Write new data files
+        new_files = list(
+            _dataframe_to_data_files(
+                table_metadata=table_metadata,
+                df=arrow_table,
+                io=io,
+            )
+        )
+
+        return list(group.data_files), new_files
+
+    def _commit(self) -> UpdatesAndRequirements:
+        """Execute file rewriting and return metadata updates."""
+        # Get candidates
+        candidates = self._get_candidate_files()
+        if not candidates:
+            logger.info("No files found to rewrite")
+            self._staged_result = RewriteDataFilesResult()
+            return (), ()
+
+        logger.info("Found %d files to rewrite", len(candidates))
+
+        # Group by partition
+        partition_groups = self._group_files_by_partition(candidates)
+        logger.info("Files grouped into %d partitions", len(partition_groups))
+
+        # Bin-pack
+        file_groups = self._bin_pack_groups(partition_groups)
+        logger.info("Created %d file groups for rewriting", len(file_groups))
+
+        if not file_groups:
+            logger.info("No file groups meet the minimum input files requirement")
+            self._staged_result = RewriteDataFilesResult()
+            return (), ()
+
+        # Rewrite each group
+        result = RewriteDataFilesResult()
+        all_files_to_delete: list[DataFile] = []
+        all_files_to_add: list[DataFile] = []
+
+        for group in file_groups:
+            try:
+                files_to_delete, files_to_add = self._rewrite_group(group)
+                all_files_to_delete.extend(files_to_delete)
+                all_files_to_add.extend(files_to_add)
+                result.rewritten_data_files_count += len(files_to_delete)
+                result.added_data_files_count += len(files_to_add)
+                result.rewritten_bytes += group.total_size_bytes
+                logger.info(
+                    "Rewrote group: %d files (%d bytes) -> %d files",
+                    len(files_to_delete),
+                    group.total_size_bytes,
+                    len(files_to_add),
+                )
+            except Exception as e:
+                logger.warning("Failed to rewrite file group: %s", str(e))
+                result.failed_group_count += 1
+
+        self._staged_result = result
+
+        if not all_files_to_delete:
+            logger.info("No files were rewritten")
+            return (), ()
+
+        # Create _OverwriteFiles and get updates
+        io = self._transaction._table.io
+        overwrite = _OverwriteFiles(
+            operation=Operation.OVERWRITE,
+            transaction=self._transaction,
+            io=io,
+        )
+        for new_file in all_files_to_add:
+            overwrite.append_data_file(new_file)
+        for old_file in all_files_to_delete:
+            overwrite.delete_data_file(old_file)
+
+        # Get updates from overwrite (writes manifests, returns updates)
+        updates = overwrite._commit()
+
+        logger.info(
+            "Rewrite complete: %d files -> %d files (%d bytes rewritten)",
+            result.rewritten_data_files_count,
+            result.added_data_files_count,
+            result.rewritten_bytes,
+        )
+
+        return updates
+
+    def commit(self) -> RewriteDataFilesResult:
+        """Execute rewrite and commit changes.
+
+        With autocommit=True (default), commits to catalog immediately.
+        With autocommit=False, only stages - call _transaction.commit_transaction() later.
+        """
+        self._transaction._apply(*self._commit())
+        return self._staged_result or RewriteDataFilesResult()

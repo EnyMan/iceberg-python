@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pyiceberg.table import Table
-    from pyiceberg.table.update.snapshot import ExpireSnapshots
+    from pyiceberg.table.update.snapshot import ExpireSnapshots, RewriteDataFiles
 
 
 class MaintenanceTable:
@@ -43,3 +43,30 @@ class MaintenanceTable:
         from pyiceberg.table.update.snapshot import ExpireSnapshots
 
         return ExpireSnapshots(transaction=Transaction(self.tbl, autocommit=True))
+
+    def rewrite_data_files(self) -> RewriteDataFiles:
+        """Return a RewriteDataFiles builder for compaction operations.
+
+        This operation reads small data files and rewrites them into larger,
+        optimally-sized files. Files are selected based on size thresholds and
+        grouped by partition for efficient processing.
+
+        Example:
+            result = (
+                table.maintenance
+                .rewrite_data_files()
+                .filter("year = 2024")  # Optional: restrict to partitions
+                .option("target-file-size-bytes", "134217728")  # Optional: 128MB
+                .commit()
+            )
+
+            print(f"Rewrote {result.rewritten_data_files_count} files into "
+                  f"{result.added_data_files_count} files")
+
+        Returns:
+            RewriteDataFiles builder for configuring and executing file compaction.
+        """
+        from pyiceberg.table import Transaction
+        from pyiceberg.table.update.snapshot import RewriteDataFiles
+
+        return RewriteDataFiles(transaction=Transaction(self.tbl, autocommit=True))
