@@ -16,6 +16,7 @@
 # under the License.
 from __future__ import annotations
 
+import concurrent.futures
 import itertools
 import os
 import uuid
@@ -853,28 +854,65 @@ class Transaction:
 
         matched_iceberg_record_batches = matched_iceberg_record_batches_scan.to_arrow_batch_reader()
 
-        batches_to_overwrite = []
-        overwrite_predicates = []
+        batches_to_overwrite: list[pa.Table] = []
+        overwrite_predicates: list[BooleanExpression] = []
         # Accumulate matched keys for anti-join insert filtering after the batch loop.
         # We only store key columns (not full rows) to minimize memory usage.
         matched_target_keys: list[pa.Table] = []
 
-        for batch in matched_iceberg_record_batches:
+        def process_upsert_batch(
+            batch: pa.RecordBatch,
+        ) -> tuple[pa.Table | None, BooleanExpression | None, pa.Table | None]:
+            """Process a single batch for upsert, returning (rows_to_update, predicate, matched_keys)."""
             rows = pa.Table.from_batches([batch])
+            rows_to_update = None
+            predicate = None
+            matched_keys = None
 
             if when_matched_update_all:
                 # Check non-key columns to see if values have actually changed.
                 # We don't want to do a blanket overwrite for matched rows if the
                 # actual non-key column data hasn't changed - this avoids unnecessary IO and writes.
-                rows_to_update = upsert_util.get_rows_to_update(df, rows, join_cols)
-
-                if len(rows_to_update) > 0:
-                    overwrite_mask_predicate = upsert_util.create_match_filter(rows_to_update, join_cols)
-                    batches_to_overwrite.append(rows_to_update)
-                    overwrite_predicates.append(overwrite_mask_predicate)
+                candidate_rows = upsert_util.get_rows_to_update(df, rows, join_cols)
+                if len(candidate_rows) > 0:
+                    rows_to_update = candidate_rows
+                    predicate = upsert_util.create_match_filter(candidate_rows, join_cols)
 
             if when_not_matched_insert_all:
-                matched_target_keys.append(rows.select(join_cols))
+                matched_keys = rows.select(join_cols)
+
+            return (rows_to_update, predicate, matched_keys)
+
+        def collect_result(
+            future: concurrent.futures.Future[tuple[pa.Table | None, BooleanExpression | None, pa.Table | None]],
+        ) -> None:
+            """Process a completed future and collect its results."""
+            rows_to_update, predicate, matched_keys = future.result()
+            if rows_to_update is not None and predicate is not None:
+                batches_to_overwrite.append(rows_to_update)
+                overwrite_predicates.append(predicate)
+            if matched_keys is not None:
+                matched_target_keys.append(matched_keys)
+
+        executor = ExecutorFactory.get_or_create()
+        max_concurrent = ExecutorFactory.max_workers() or (os.cpu_count() or 8) + 4
+        pending_futures: set[
+            concurrent.futures.Future[tuple[pa.Table | None, BooleanExpression | None, pa.Table | None]]
+        ] = set()
+
+        for batch in matched_iceberg_record_batches:
+            # Backpressure: if at capacity, wait for one task to complete before reading next batch
+            if len(pending_futures) >= max_concurrent:
+                done, pending_futures = concurrent.futures.wait(pending_futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in done:
+                    collect_result(future)
+
+            future = executor.submit(process_upsert_batch, batch)
+            pending_futures.add(future)
+
+        # Drain remaining futures
+        for future in concurrent.futures.as_completed(pending_futures):
+            collect_result(future)
 
         # Use anti-join to find rows to insert. This is more efficient than per-batch
         # expression filtering because: (1) we build expressions once, not per batch,
