@@ -16,7 +16,6 @@
 # under the License.
 from __future__ import annotations
 
-import concurrent.futures
 import itertools
 import os
 import uuid
@@ -852,95 +851,36 @@ class Transaction:
         if branch in self.table_metadata.refs:
             matched_iceberg_record_batches_scan = matched_iceberg_record_batches_scan.use_ref(branch)
 
-        matched_iceberg_record_batches = matched_iceberg_record_batches_scan.to_arrow_batch_reader()
+        matched_iceberg_rows = matched_iceberg_record_batches_scan.to_arrow()
 
-        batches_to_overwrite: list[pa.Table] = []
-        overwrite_predicates: list[BooleanExpression] = []
-        # Accumulate matched keys for anti-join insert filtering after the batch loop.
-        # We only store key columns (not full rows) to minimize memory usage.
-        matched_target_keys: list[pa.Table] = []
+        rows_to_update = None
+        overwrite_filter = None
 
-        def process_upsert_batch(
-            batch: pa.RecordBatch,
-        ) -> tuple[pa.Table | None, BooleanExpression | None, pa.Table | None]:
-            """Process a single batch for upsert, returning (rows_to_update, predicate, matched_keys)."""
-            rows = pa.Table.from_batches([batch])
-            rows_to_update = None
-            predicate = None
-            matched_keys = None
+        if when_matched_update_all and len(matched_iceberg_rows) > 0:
+            rows_to_update = upsert_util.get_rows_to_update(df, matched_iceberg_rows, join_cols)
+            if len(rows_to_update) > 0:
+                overwrite_filter = upsert_util.create_match_filter(rows_to_update, join_cols)
 
-            if when_matched_update_all:
-                # Check non-key columns to see if values have actually changed.
-                # We don't want to do a blanket overwrite for matched rows if the
-                # actual non-key column data hasn't changed - this avoids unnecessary IO and writes.
-                candidate_rows = upsert_util.get_rows_to_update(df, rows, join_cols)
-                if len(candidate_rows) > 0:
-                    rows_to_update = candidate_rows
-                    predicate = upsert_util.create_match_filter(candidate_rows, join_cols)
-
-            if when_not_matched_insert_all:
-                matched_keys = rows.select(join_cols)
-
-            return (rows_to_update, predicate, matched_keys)
-
-        def collect_result(
-            future: concurrent.futures.Future[tuple[pa.Table | None, BooleanExpression | None, pa.Table | None]],
-        ) -> None:
-            """Process a completed future and collect its results."""
-            rows_to_update, predicate, matched_keys = future.result()
-            if rows_to_update is not None and predicate is not None:
-                batches_to_overwrite.append(rows_to_update)
-                overwrite_predicates.append(predicate)
-            if matched_keys is not None:
-                matched_target_keys.append(matched_keys)
-
-        executor = ExecutorFactory.get_or_create()
-        max_concurrent = ExecutorFactory.max_workers() or (os.cpu_count() or 8) + 4
-        pending_futures: set[
-            concurrent.futures.Future[tuple[pa.Table | None, BooleanExpression | None, pa.Table | None]]
-        ] = set()
-
-        for batch in matched_iceberg_record_batches:
-            # Backpressure: if at capacity, wait for one task to complete before reading next batch
-            if len(pending_futures) >= max_concurrent:
-                done, pending_futures = concurrent.futures.wait(pending_futures, return_when=concurrent.futures.FIRST_COMPLETED)
-                for future in done:
-                    collect_result(future)
-
-            future = executor.submit(process_upsert_batch, batch)
-            pending_futures.add(future)
-
-        # Drain remaining futures
-        for future in concurrent.futures.as_completed(pending_futures):
-            collect_result(future)
-
-        # Use anti-join to find rows to insert. This is more efficient than per-batch
-        # expression filtering because: (1) we build expressions once, not per batch,
-        # and (2) PyArrow joins are faster than evaluating large Or(...) expressions.
+        # Use anti-join to find rows to insert
         rows_to_insert = df
-        if when_not_matched_insert_all and matched_target_keys:
-            # Combine all matched keys and deduplicate
-            combined_matched_keys = pa.concat_tables(matched_target_keys).group_by(join_cols).aggregate([])
-            # Cast matched keys to source schema types for join compatibility
+        if when_not_matched_insert_all and len(matched_iceberg_rows) > 0:
+            matched_keys = matched_iceberg_rows.select(join_cols).group_by(join_cols).aggregate([])
             source_key_schema = df.select(join_cols).schema
-            combined_matched_keys = combined_matched_keys.cast(source_key_schema)
-            # Use anti-join on key columns only (with row indices) to avoid issues with
-            # struct/list types in non-key columns that PyArrow join doesn't support
+            matched_keys = matched_keys.cast(source_key_schema)
             row_indices = pa.chunked_array([pa.array(range(len(df)), type=pa.int64())])
             source_keys_with_idx = df.select(join_cols).append_column("__row_idx__", row_indices)
-            not_matched_keys = source_keys_with_idx.join(combined_matched_keys, keys=join_cols, join_type="left anti")
+            not_matched_keys = source_keys_with_idx.join(matched_keys, keys=join_cols, join_type="left anti")
             indices_to_keep = not_matched_keys.column("__row_idx__").combine_chunks()
             rows_to_insert = df.take(indices_to_keep)
 
         update_row_cnt = 0
         insert_row_cnt = 0
 
-        if batches_to_overwrite:
-            rows_to_update = pa.concat_tables(batches_to_overwrite)
+        if rows_to_update is not None and len(rows_to_update) > 0:
             update_row_cnt = len(rows_to_update)
             self.overwrite(
                 rows_to_update,
-                overwrite_filter=Or(*overwrite_predicates) if len(overwrite_predicates) > 1 else overwrite_predicates[0],
+                overwrite_filter=overwrite_filter,
                 branch=branch,
                 snapshot_properties=snapshot_properties,
             )
