@@ -75,6 +75,16 @@ def _is_numeric_type(arrow_type: pa.DataType) -> bool:
     return pa.types.is_integer(arrow_type) or pa.types.is_floating(arrow_type)
 
 
+def _is_variable_length_type(arrow_type: pa.DataType) -> bool:
+    """Check if a PyArrow type is variable-length (string/binary), making comparison more expensive."""
+    return (
+        pa.types.is_string(arrow_type)
+        or pa.types.is_large_string(arrow_type)
+        or pa.types.is_binary(arrow_type)
+        or pa.types.is_large_binary(arrow_type)
+    )
+
+
 def _create_range_filter(col_name: str, values: pa.Array) -> BooleanExpression:
     """Create a min/max range filter for a numeric column."""
     min_val = pc.min(values).as_py()
@@ -83,6 +93,19 @@ def _create_range_filter(col_name: str, values: pa.Array) -> BooleanExpression:
 
 
 def create_coarse_match_filter(df: pyarrow_table, join_cols: list[str]) -> BooleanExpression:
+    """
+    Create a coarse Iceberg BooleanExpression filter for initial row scanning.
+
+    Convenience wrapper that computes unique keys internally.
+    See create_coarse_match_filter_from_keys() for the full docstring.
+    """
+    unique_keys = df.select(join_cols).group_by(join_cols).aggregate([])
+    return create_coarse_match_filter_from_keys(unique_keys, join_cols)
+
+
+def create_coarse_match_filter_from_keys(
+    unique_keys: pyarrow_table, join_cols: list[str]
+) -> BooleanExpression:
     """
     Create a coarse Iceberg BooleanExpression filter for initial row scanning.
 
@@ -108,13 +131,12 @@ def create_coarse_match_filter(df: pyarrow_table, join_cols: list[str]) -> Boole
     non-matching rows, making a full scan more practical.
 
     Args:
-        df: PyArrow table containing the source data with join columns
+        unique_keys: PyArrow table of pre-computed unique key combinations
         join_cols: List of column names to use for matching
 
     Returns:
         BooleanExpression filter for Iceberg table scan
     """
-    unique_keys = df.select(join_cols).group_by(join_cols).aggregate([])
     num_unique_keys = len(unique_keys)
 
     if num_unique_keys == 0:
@@ -188,7 +210,9 @@ def create_coarse_match_filter(df: pyarrow_table, join_cols: list[str]) -> Boole
 
 def has_duplicate_rows(df: pyarrow_table, join_cols: list[str]) -> bool:
     """Check for duplicate rows in a PyArrow table based on the join columns."""
-    return len(df.select(join_cols).group_by(join_cols).aggregate([([], "count_all")]).filter(pc.field("count_all") > 1)) > 0
+    if len(join_cols) == 1:
+        return len(pc.unique(df.column(join_cols[0]))) < len(df)
+    return len(df.select(join_cols).group_by(join_cols).aggregate([])) < len(df)
 
 
 def _compare_columns_vectorized(source_col: pa.Array | pa.ChunkedArray, target_col: pa.Array | pa.ChunkedArray) -> pa.Array:
@@ -323,11 +347,13 @@ def get_rows_to_update(source_table: pa.Table, target_table: pa.Table, join_cols
         ) from None
 
     # Step 1: Prepare source index with join keys and a marker index
-    # Cast source to target schema to ensure type compatibility for the join
+    # Cast only join columns to target schema for type compatibility
     # (e.g., source int32 vs target int64 would cause join issues)
+    # Select before cast to avoid copying non-join columns (especially large string columns)
+    source_join_schema = pa.schema([target_table.schema.field(col) for col in join_cols])
     source_index = (
-        source_table.cast(target_table.schema)
-        .select(join_cols_set)
+        source_table.select(join_cols)
+        .cast(source_join_schema)
         .append_column(SOURCE_INDEX_COLUMN_NAME, pa.array(range(len(source_table))))
     )
 
@@ -341,26 +367,69 @@ def get_rows_to_update(source_table: pa.Table, target_table: pa.Table, join_cols
         # No matching rows found
         return source_table.schema.empty_table()
 
-    # Step 4: Take matched rows in batch (vectorized - single operation)
+    # Step 4: Extract matched index arrays
     source_indices = matching_indices[SOURCE_INDEX_COLUMN_NAME]
     target_indices = matching_indices[TARGET_INDEX_COLUMN_NAME]
 
-    matched_source = source_table.take(source_indices)
-    matched_target = target_table.take(target_indices)
-
-    # Step 5: Vectorized comparison per column
-    diff_masks = []
+    # Step 5: Compare columns using column-by-column take (avoids full-table materialization).
+    # Partition into cheap (fixed-width) and expensive (variable-length string/binary) columns.
+    # Compare cheap columns first so we can skip expensive comparisons for already-different rows.
+    cheap_cols = []
+    expensive_cols = []
     for col in non_key_cols:
-        source_col = matched_source.column(col)
-        target_col = matched_target.column(col)
-        col_diff = _compare_columns_vectorized(source_col, target_col)
-        diff_masks.append(col_diff)
+        col_type = source_table.schema.field(col).type
+        if _is_variable_length_type(col_type):
+            expensive_cols.append(col)
+        else:
+            cheap_cols.append(col)
 
-    # Step 6: Combine masks with OR (any column different = needs update)
-    combined_mask = functools.reduce(pc.or_, diff_masks)
+    # Phase 1: Compare cheap (fixed-width) columns
+    diff_masks = []
+    for col in cheap_cols:
+        source_col = source_table.column(col).take(source_indices)
+        target_col = target_table.column(col).take(target_indices)
+        diff_masks.append(_compare_columns_vectorized(source_col, target_col))
 
-    # Step 7: Filter to get indices of rows that need updating
-    to_update_indices = pc.filter(source_indices, combined_mask)
+    # Phase 2: For expensive columns, only take+compare rows not yet identified as different
+    if expensive_cols:
+        if diff_masks:
+            cheap_diff = functools.reduce(pc.or_, diff_masks)
+            need_string_check = pc.invert(cheap_diff)
+            remaining_count = pc.sum(need_string_check).as_py()
+        else:
+            cheap_diff = None
+            remaining_count = len(source_indices)
+
+        if remaining_count > 0:
+            if cheap_diff is not None and remaining_count < len(source_indices):
+                check_source_idx = pc.filter(source_indices, need_string_check)
+                check_target_idx = pc.filter(target_indices, need_string_check)
+            else:
+                check_source_idx = source_indices
+                check_target_idx = target_indices
+
+            string_masks = []
+            for col in expensive_cols:
+                source_col = source_table.column(col).take(check_source_idx)
+                target_col = target_table.column(col).take(check_target_idx)
+                string_masks.append(_compare_columns_vectorized(source_col, target_col))
+
+            string_diff = functools.reduce(pc.or_, string_masks)
+            string_update_idx = pc.filter(check_source_idx, string_diff)
+
+            if cheap_diff is not None:
+                cheap_update_idx = pc.filter(source_indices, cheap_diff)
+                # concat_arrays requires Array, not ChunkedArray
+                cheap_arr = cheap_update_idx.combine_chunks() if isinstance(cheap_update_idx, pa.ChunkedArray) else cheap_update_idx
+                string_arr = string_update_idx.combine_chunks() if isinstance(string_update_idx, pa.ChunkedArray) else string_update_idx
+                to_update_indices = pa.concat_arrays([cheap_arr, string_arr])
+            else:
+                to_update_indices = string_update_idx
+        else:
+            to_update_indices = pc.filter(source_indices, cheap_diff)
+    else:
+        combined_mask = functools.reduce(pc.or_, diff_masks)
+        to_update_indices = pc.filter(source_indices, combined_mask)
 
     if len(to_update_indices) > 0:
         return source_table.take(to_update_indices)

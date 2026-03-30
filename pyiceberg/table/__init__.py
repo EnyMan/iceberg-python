@@ -821,7 +821,9 @@ class Transaction:
         if not when_matched_update_all and not when_not_matched_insert_all:
             raise ValueError("no upsert options selected...exiting")
 
-        if upsert_util.has_duplicate_rows(df, join_cols):
+        # Compute unique keys once and reuse for both duplicate check and coarse filter
+        source_unique_keys = df.select(join_cols).group_by(join_cols).aggregate([])
+        if len(source_unique_keys) < len(df):
             raise ValueError("Duplicate rows found in source dataset based on the key columns. No upsert executed")
 
         from pyiceberg.io.pyarrow import _check_pyarrow_schema_compatible
@@ -837,7 +839,7 @@ class Transaction:
         # Create a coarse filter for the initial scan to reduce the number of rows read.
         # This filter is intentionally less precise but faster to evaluate than exact matching.
         # Exact key matching happens downstream in get_rows_to_update() via PyArrow joins.
-        matched_predicate = upsert_util.create_coarse_match_filter(df, join_cols)
+        matched_predicate = upsert_util.create_coarse_match_filter_from_keys(source_unique_keys, join_cols)
 
         # We must use Transaction.table_metadata for the scan. This includes all uncommitted - but relevant - changes.
 
